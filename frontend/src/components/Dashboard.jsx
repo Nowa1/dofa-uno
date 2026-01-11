@@ -1,13 +1,17 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Zap, Brain, Sparkles, CheckCircle2, Circle, AlertCircle, Play } from 'lucide-react';
+import { Zap, Brain, Sparkles, CheckCircle2, Circle, AlertCircle, Play, LogOut } from 'lucide-react';
 import { initSounds, playCompletionSound } from '../utils/sounds';
-import { parseDump, getTasks, completeTask } from '../utils/api';
+import { parseDump, getTasks, completeTask, logout } from '../utils/api';
+import useAuthStore from '../stores/authStore';
 import BacklogView from './BacklogView';
 import StatsPanel from './StatsPanel';
 import PropTypes from 'prop-types';
 
 const Dashboard = ({ onStartTask, onTaskCountChange, onTaskComplete }) => {
+  const navigate = useNavigate();
+  const { clearUser, user } = useAuthStore();
   const [brainDumpText, setBrainDumpText] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [tasks, setTasks] = useState([]);
@@ -150,6 +154,19 @@ const Dashboard = ({ onStartTask, onTaskCountChange, onTaskComplete }) => {
     }
   };
 
+  const handleLogout = async () => {
+    try {
+      await logout();
+      clearUser();
+      navigate('/login');
+    } catch (error) {
+      console.error('Logout failed:', error);
+      // Still clear user and redirect even if API call fails
+      clearUser();
+      navigate('/login');
+    }
+  };
+
   const quickWins = tasks.filter(task => task.type === 'quick_win' || task.tag === 'quick_win');
   const deepWork = tasks.filter(task => task.type === 'deep_work' || task.tag === 'deep_work');
   const completedCount = tasks.filter(task => task.status === 'done').length;
@@ -230,14 +247,35 @@ const Dashboard = ({ onStartTask, onTaskCountChange, onTaskComplete }) => {
         <motion.header
           initial={{ opacity: 0, y: -20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="mb-8 sm:mb-12 text-center"
+          className="mb-8 sm:mb-12 relative"
         >
-          <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold mb-3 sm:mb-4 bg-gradient-to-r from-neon-blue via-accent-purple to-neon-pink bg-clip-text text-transparent">
-            NEMESIS
-          </h1>
-          <p className="text-text-secondary text-base sm:text-lg">
-            Clear your mind. Conquer your tasks.
-          </p>
+          {/* Logout Button - Top Right */}
+          <div className="absolute top-0 right-0 flex items-center gap-3">
+            {user && (
+              <span className="text-text-secondary text-sm hidden sm:inline">
+                {user.full_name || user.email}
+              </span>
+            )}
+            <motion.button
+              onClick={handleLogout}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              className="flex items-center gap-2 px-4 py-2 bg-bg-secondary border border-red-500/30 rounded-lg text-red-400 hover:border-red-500 hover:bg-red-500/10 transition-all"
+            >
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:inline">Logout</span>
+            </motion.button>
+          </div>
+
+          {/* Title */}
+          <div className="text-center">
+            <h1 className="text-4xl sm:text-5xl md:text-6xl font-bold mb-3 sm:mb-4 bg-gradient-to-r from-neon-blue via-accent-purple to-neon-pink bg-clip-text text-transparent">
+              NEMESIS
+            </h1>
+            <p className="text-text-secondary text-base sm:text-lg">
+              Clear your mind. Conquer your tasks.
+            </p>
+          </div>
         </motion.header>
 
         {/* Tab Navigation */}

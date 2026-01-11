@@ -1,13 +1,20 @@
 import { useState, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import Dashboard from './components/Dashboard';
 import Mascot from './components/Mascot';
 import NeuroTunnel from './components/NeuroTunnel';
 import GamificationHUD from './components/GamificationHUD';
 import AchievementToast from './components/AchievementToast';
 import LevelUpModal from './components/LevelUpModal';
+import ProtectedRoute from './components/ProtectedRoute';
+import AuthLayout from './components/AuthLayout';
+import LoginForm from './components/LoginForm';
+import RegisterForm from './components/RegisterForm';
+import useAuthStore from './stores/authStore';
+import { getCurrentUser } from './utils/api';
 import confetti from 'canvas-confetti';
 
-function App() {
+function DashboardWrapper() {
   const [mascotState, setMascotState] = useState('idle');
   const [activeTask, setActiveTask] = useState(null);
   const [incompleteTaskCount, setIncompleteTaskCount] = useState(0);
@@ -153,6 +160,69 @@ function App() {
         onClose={handleCloseLevelUpModal}
       />
     </div>
+  );
+}
+
+function App() {
+  const { setUser, setLoading, isAuthenticated } = useAuthStore();
+  
+  useEffect(() => {
+    // Check authentication on app load
+    async function checkAuth() {
+      try {
+        const user = await getCurrentUser();
+        setUser(user);
+      } catch (error) {
+        console.error('Auth check failed:', error);
+        setUser(null);
+      }
+    }
+    checkAuth();
+  }, [setUser]);
+  
+  return (
+    <BrowserRouter>
+      <Routes>
+        {/* Auth Routes */}
+        <Route 
+          path="/login" 
+          element={
+            isAuthenticated ? (
+              <Navigate to="/" replace />
+            ) : (
+              <AuthLayout>
+                <LoginForm />
+              </AuthLayout>
+            )
+          } 
+        />
+        <Route 
+          path="/register" 
+          element={
+            isAuthenticated ? (
+              <Navigate to="/" replace />
+            ) : (
+              <AuthLayout>
+                <RegisterForm />
+              </AuthLayout>
+            )
+          } 
+        />
+        
+        {/* Protected Dashboard Route */}
+        <Route 
+          path="/" 
+          element={
+            <ProtectedRoute>
+              <DashboardWrapper />
+            </ProtectedRoute>
+          } 
+        />
+        
+        {/* Catch all - redirect to home */}
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 

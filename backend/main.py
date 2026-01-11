@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
@@ -18,6 +19,13 @@ from database import (
 from gamification import (
     calculate_xp, calculate_level, check_level_up, update_streak,
     check_achievements, get_xp_progress, ACHIEVEMENTS
+)
+# Import authentication module
+from auth import (
+    get_password_hash, authenticate_user, create_access_token,
+    get_current_user, set_auth_cookie, clear_auth_cookie,
+    get_google_oauth_url, exchange_google_code, get_google_user_info,
+    get_or_create_oauth_user, FRONTEND_URL
 )
 
 # Load environment variables from .env file
@@ -40,10 +48,11 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLO
 ]
 
 # Configure CORS - must be before routes
+# IMPORTANT: allow_credentials=True is required for cookie-based authentication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=True,  # Required for cookies
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -61,6 +70,29 @@ async def startup_event():
     print("Database initialized successfully!")
 
 # Pydantic Models for API
+
+# Auth Models
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    full_name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    email: str
+    full_name: Optional[str]
+    oauth_provider: Optional[str]
+    total_xp: int
+    current_level: int
+    current_streak: int
+
+class AuthResponse(BaseModel):
+    user: UserResponse
+    message: str
 
 class DumpRequest(BaseModel):
     text: str
@@ -212,11 +244,205 @@ def db_task_to_pydantic(db_task: DBTask) -> Task:
 async def root():
     return {"message": "Dofa.uno API is running"}
 
+
+# Authentication Endpoints
+
+@app.post("/api/auth/register", response_model=AuthResponse)
+async def register(request: RegisterRequest, response: Response, db: Session = Depends(get_db)):
+    """
+    Register a new user with email and password.
+    Creates user account and sets authentication cookie.
+    """
+    # Check if user already exists
+    existing_user = db.query(UserProfile).filter(UserProfile.email == request.email).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(request.password)
+    new_user = UserProfile(
+        email=request.email,
+        hashed_password=hashed_password,
+        full_name=request.full_name,
+        is_active=True,
+        email_verified=False,
+        total_xp=0,
+        current_level=1,
+        current_streak=0,
+        longest_streak=0
+    )
+    
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": new_user.id})
+    
+    # Set cookie
+    set_auth_cookie(response, access_token)
+    
+    return AuthResponse(
+        user=UserResponse(
+            id=new_user.id,
+            email=new_user.email,
+            full_name=new_user.full_name,
+            oauth_provider=new_user.oauth_provider,
+            total_xp=new_user.total_xp,
+            current_level=new_user.current_level,
+            current_streak=new_user.current_streak
+        ),
+        message="Registration successful"
+    )
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(request: LoginRequest, response: Response, db: Session = Depends(get_db)):
+    """
+    Login with email and password.
+    Sets authentication cookie on success.
+    """
+    user = authenticate_user(db, request.email, request.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password"
+        )
+    
+    if not user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="Account is inactive"
+        )
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": user.id})
+    
+    # Set cookie
+    set_auth_cookie(response, access_token)
+    
+    return AuthResponse(
+        user=UserResponse(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            oauth_provider=user.oauth_provider,
+            total_xp=user.total_xp,
+            current_level=user.current_level,
+            current_streak=user.current_streak
+        ),
+        message="Login successful"
+    )
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    """
+    Logout user by clearing authentication cookie.
+    """
+    clear_auth_cookie(response)
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/api/auth/me", response_model=UserResponse)
+async def get_me(current_user: UserProfile = Depends(get_current_user)):
+    """
+    Get current authenticated user information.
+    Protected endpoint - requires authentication.
+    """
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        oauth_provider=current_user.oauth_provider,
+        total_xp=current_user.total_xp,
+        current_level=current_user.current_level,
+        current_streak=current_user.current_streak
+    )
+
+
+@app.get("/api/auth/google")
+async def google_login(request: Request):
+    """
+    Initiate Google OAuth flow.
+    Redirects to Google consent screen.
+    """
+    # Build redirect URI
+    redirect_uri = f"{request.base_url}api/auth/google/callback"
+    
+    # Get Google OAuth URL
+    auth_url = get_google_oauth_url(str(redirect_uri))
+    
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/api/auth/google/callback")
+async def google_callback(code: str, request: Request, response: Response, db: Session = Depends(get_db)):
+    """
+    Handle Google OAuth callback.
+    Exchanges code for tokens, gets user info, creates/updates user, and sets auth cookie.
+    """
+    try:
+        # Build redirect URI
+        redirect_uri = f"{request.base_url}api/auth/google/callback"
+        
+        # Exchange code for tokens
+        token_data = await exchange_google_code(code, str(redirect_uri))
+        access_token = token_data.get("access_token")
+        
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to get access token")
+        
+        # Get user info from Google
+        user_info = await get_google_user_info(access_token)
+        
+        # Extract user data
+        email = user_info.get("email")
+        google_id = user_info.get("id")
+        full_name = user_info.get("name")
+        email_verified = user_info.get("verified_email", False)
+        
+        if not email or not google_id:
+            raise HTTPException(status_code=400, detail="Failed to get user info from Google")
+        
+        # Get or create user
+        user = get_or_create_oauth_user(
+            db=db,
+            email=email,
+            oauth_provider="google",
+            oauth_id=google_id,
+            full_name=full_name,
+            email_verified=email_verified
+        )
+        
+        # Create access token for our app
+        app_token = create_access_token(data={"sub": user.id})
+        
+        # Set cookie
+        set_auth_cookie(response, app_token)
+        
+        # Redirect to frontend
+        return RedirectResponse(url=FRONTEND_URL)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OAuth error: {str(e)}")
+
+
 @app.post("/api/parse_dump", response_model=ParseResponse)
-async def parse_dump(request: DumpRequest, db: Session = Depends(get_db)):
+async def parse_dump(
+    request: DumpRequest,
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Parse unstructured text and extract structured tasks using OpenAI.
     Now saves tasks to database.
+    Protected endpoint - requires authentication.
     """
     if not request.text or not request.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
@@ -254,8 +480,8 @@ async def parse_dump(request: DumpRequest, db: Session = Depends(get_db)):
         if not isinstance(tasks_data, list):
             raise ValueError("Expected a list of tasks")
         
-        # Get or create user
-        user = get_or_create_user(db, user_id=1)
+        # Use authenticated user
+        user = current_user
         
         # Validate and save each task to database
         validated_tasks = []
@@ -306,14 +532,22 @@ async def parse_dump(request: DumpRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Error parsing tasks: {str(e)}")
 
 @app.get("/api/tasks", response_model=TasksResponse)
-async def get_tasks(status: Optional[str] = None, db: Session = Depends(get_db)):
+async def get_tasks(
+    status: Optional[str] = None,
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get tasks filtered by status.
+    Protected endpoint - requires authentication.
     
     Query params:
     - status: 'todo', 'done', or 'all' (default: 'todo')
     """
-    query = db.query(DBTask).filter(DBTask.is_deleted == False)
+    query = db.query(DBTask).filter(
+        DBTask.user_id == current_user.id,
+        DBTask.is_deleted == False
+    )
     
     if status == "done":
         query = query.filter(DBTask.status == "done")
@@ -328,12 +562,21 @@ async def get_tasks(status: Optional[str] = None, db: Session = Depends(get_db))
     return TasksResponse(tasks=tasks, count=len(tasks))
 
 @app.post("/api/tasks/{task_id}/complete", response_model=CompleteTaskResponse)
-async def complete_task(task_id: str, db: Session = Depends(get_db)):
+async def complete_task(
+    task_id: str,
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Mark a task as complete and award XP, update streaks, check achievements.
+    Protected endpoint - requires authentication.
     """
-    # Get task
-    db_task = db.query(DBTask).filter(DBTask.id == task_id, DBTask.is_deleted == False).first()
+    # Get task (ensure it belongs to current user)
+    db_task = db.query(DBTask).filter(
+        DBTask.id == task_id,
+        DBTask.user_id == current_user.id,
+        DBTask.is_deleted == False
+    ).first()
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
     
@@ -341,8 +584,8 @@ async def complete_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Task already completed")
     
     try:
-        # Get user profile
-        user = get_or_create_user(db, user_id=db_task.user_id)
+        # Use current authenticated user
+        user = current_user
         
         # Calculate XP for this task
         xp_earned = calculate_xp(db_task)
@@ -399,10 +642,12 @@ async def get_backlog(
     page: int = 1,
     limit: int = 20,
     search: Optional[str] = None,
+    current_user: UserProfile = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Get completed tasks (backlog) with pagination.
+    Protected endpoint - requires authentication.
     
     Query params:
     - page: Page number (default: 1)
@@ -410,6 +655,7 @@ async def get_backlog(
     - search: Search term for title/description (optional)
     """
     query = db.query(DBTask).filter(
+        DBTask.user_id == current_user.id,
         DBTask.status == "done",
         DBTask.is_deleted == False
     )
@@ -440,11 +686,15 @@ async def get_backlog(
     )
 
 @app.get("/api/profile", response_model=ProfileResponse)
-async def get_profile(db: Session = Depends(get_db)):
+async def get_profile(
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get user profile with XP, level, and streak information.
+    Protected endpoint - requires authentication.
     """
-    user = get_or_create_user(db, user_id=1)
+    user = current_user
     xp_progress = get_xp_progress(user)
     
     return ProfileResponse(
@@ -457,11 +707,15 @@ async def get_profile(db: Session = Depends(get_db)):
     )
 
 @app.get("/api/achievements", response_model=AchievementsResponse)
-async def get_achievements(db: Session = Depends(get_db)):
+async def get_achievements(
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get all achievements (locked and unlocked) with progress for the user.
+    Protected endpoint - requires authentication.
     """
-    user = get_or_create_user(db, user_id=1)
+    user = current_user
     
     # Get unlocked achievements
     db_achievements = db.query(DBAchievement).filter(
@@ -522,14 +776,19 @@ async def get_achievements(db: Session = Depends(get_db)):
     return AchievementsResponse(achievements=achievements, count=len(achievements))
 
 @app.get("/api/stats", response_model=StatsResponse)
-async def get_stats(period: str = "week", db: Session = Depends(get_db)):
+async def get_stats(
+    period: str = "week",
+    current_user: UserProfile = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     """
     Get aggregated statistics for a time period.
+    Protected endpoint - requires authentication.
     
     Query params:
     - period: 'week', 'month', 'all' (default: 'week')
     """
-    user = get_or_create_user(db, user_id=1)
+    user = current_user
     
     # Calculate date range
     now = datetime.now(timezone.utc)
@@ -638,10 +897,14 @@ def update_daily_stats(db: Session, user: UserProfile, task: DBTask):
         daily_stat.deep_work += 1
 
 @app.post("/api/chat_intervention", response_model=InterventionResponse)
-async def chat_intervention(request: InterventionRequest):
+async def chat_intervention(
+    request: InterventionRequest,
+    current_user: UserProfile = Depends(get_current_user)
+):
     """
     Provide compassionate body-double support when user is stuck on a task.
     AI acts as a supportive companion suggesting smaller, actionable steps.
+    Protected endpoint - requires authentication.
     """
     if not openai.api_key:
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
