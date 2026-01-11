@@ -17,17 +17,6 @@ class UserProfile(Base):
     __tablename__ = "user_profiles"
     
     id = Column(Integer, primary_key=True, index=True)
-    
-    # Authentication fields
-    email = Column(String, unique=True, nullable=False, index=True)
-    hashed_password = Column(String, nullable=True)  # Null for OAuth users
-    oauth_provider = Column(String, nullable=True)   # 'google' or None
-    oauth_id = Column(String, nullable=True)         # Google user ID
-    is_active = Column(Boolean, default=True)
-    email_verified = Column(Boolean, default=False)
-    full_name = Column(String, nullable=True)
-    
-    # Gamification fields
     total_xp = Column(Integer, default=0, nullable=False)
     current_level = Column(Integer, default=1, nullable=False)
     current_streak = Column(Integer, default=0, nullable=False)
